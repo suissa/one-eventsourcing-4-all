@@ -1,4 +1,7 @@
-# 🔮 one-eventsourcing-4-all
+<p align="center">
+  <img width="1448" height="1086" alt="image" src="https://github.com/user-attachments/assets/1c254960-3f2f-4074-81f0-06f31d8172e6" />
+</p>p>
+
 
 ### Event Sourcing transparente via Proxy — zero config, zero dependências.
 
