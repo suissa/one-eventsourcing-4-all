@@ -1,0 +1,12 @@
+{
+  "name": "@purecore/one-eventsourcing-4-all",
+  "version": "1.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/index.test.cjs"
+  },
+  "devDependencies": { "@types/node": "^20.10.5", "typescript": "^5.3.3" }
+}

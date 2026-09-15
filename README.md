@@ -23,14 +23,15 @@
 
 ## 🧬 O que é?
 
-**`one-eventsourcing-4-all`** é uma micro-lib TypeScript que aplica o padrão [Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html) de forma **transparente** usando `ES6 Proxy`.
+**`one-eventsourcing-4-all`** é uma micro-lib TypeScript que aplica a fronteira de Event Sourcing de forma **transparente** usando `ES6 Proxy` e os eventos do Node.
 
 Você envolve qualquer objeto — seja um POJO, uma instância de classe, um serviço, um repositório — e automaticamente **toda chamada de método** passa a emitir eventos tipados com:
 
-- 🕐 **Timestamp** exato da execução
+- 🕐 **Timestamp** ISO exato da execução
+- 🆔 **ID, correlação e causalidade** para rastreamento
 - 📦 **Payload** com argumentos e retorno
 - 🏷️ **Metadata** com nome do método e classe de origem
-- 💓 **Health Check** automático em background
+- 💓 **Health Check** opcional em background (desligado por padrão)
 
 > **Zero config. Zero dependências. Zero fricção.**
 
@@ -164,7 +165,7 @@ class OrderService {
 
 ```typescript
 const orderService = EventSourcingFactory.wrap(new OrderService(), {
-  enableHealthCheck: true,
+  enableHealthCheck: false,
   healthIntervalMs: 10_000,
   onEvent: (event) => {
     // log global de todos os eventos
@@ -216,9 +217,16 @@ Transforma um objeto em uma entidade event-sourced.
 
 ```typescript
 interface DomainEvent {
-  type: string;          // "method_return" | "health_check"
-  timestamp: number;     // Date.now()
-  payload: any;          // { args, return } ou { status, memory }
+  id: string;
+  type: string;          // "method_return" | "method_error" | "health_check"
+  canonical_name: string;
+  version: string;
+  producer: string;
+  context: string;
+  timestamp: string;
+  correlation_id: string;
+  causality_id?: string;
+  payload: unknown;
   metadata: {
     method?: string;     // Nome do método chamado
     targetClass: string; // Nome da classe original

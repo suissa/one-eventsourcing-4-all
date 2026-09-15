@@ -1,108 +1,156 @@
-/**
- * Interface que define a estrutura de um evento no sistema.
- */
-export interface DomainEvent {
+import { randomBytes, randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+
+/** A versioned fact produced by an event-sourced actor. */
+export interface DomainEvent<TPayload = unknown> {
+  /** UUIDv7 event identity. `id` is retained as the compatibility alias. */
+  event_id: string;
+  id: string;
   type: string;
-  timestamp: number;
-  payload: any;
+  canonical_name: string;
+  version: string;
+  producer: string;
+  context: string;
+  timestamp: string;
+  correlation_id: string;
+  causality_id?: string;
+  payload: TPayload;
   metadata: {
     method?: string;
     targetClass: string;
+    success?: boolean;
+    error?: { name: string; message: string };
   };
 }
 
-/**
- * Opções de configuração para o wrapper de Event Sourcing.
- */
-export interface EventSourcingOptions {
-  healthIntervalMs?: number; // Intervalo para o evento de health (default: 30000)
-  enableHealthCheck?: boolean;
-  onEvent?: (event: DomainEvent) => void; // Callback global para eventos
+export interface EventSink {
+  append(event: DomainEvent): void | Promise<void>;
 }
 
-/**
- * Tipo utilitário que adiciona capacidades de evento a um tipo existente.
- */
+type EventMetadataInput = Omit<DomainEvent['metadata'], 'targetClass'>;
+
+export interface EventSourcingOptions {
+  canonicalName?: string;
+  version?: string;
+  producer?: string;
+  context?: string;
+  correlationId?: string;
+  eventEmitter?: EventEmitter;
+  eventSink?: EventSink;
+  onEvent?: (event: DomainEvent) => void | Promise<void>;
+  /** Disabled by default so importing a module never leaves an open timer. */
+  enableHealthCheck?: boolean;
+  healthIntervalMs?: number;
+  /** Maximum number of recent events retained by the in-memory facade. */
+  maxHistory?: number;
+}
+
+/** Generates a RFC 9562 UUIDv7 with millisecond time ordering. */
+export function uuidv7(now = Date.now()): string {
+  const bytes = randomBytes(16);
+  const timestamp = BigInt(now);
+  for (let index = 5; index >= 0; index -= 1) {
+    bytes[index] = Number(timestamp >> BigInt((5 - index) * 8)) & 0xff;
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export type EventSourced<T> = T & {
-  $on: (handler: (event: DomainEvent) => void) => void;
-  $dispose: () => void;
+  $on(handler: (event: DomainEvent) => void): () => void;
+  $off(handler: (event: DomainEvent) => void): void;
+  $events(): readonly DomainEvent[];
+  $dispose(): void;
 };
 
-/**
- * Factory que encapsula objetos ou instâncias de classes com comportamentos de Event Sourcing.
- */
+/** Wraps an actor and records method returns and failures as immutable facts. */
 export class EventSourcingFactory {
-  /**
-   * Encapsula um objeto para rastrear mudanças e emitir eventos.
-   * * @param target O objeto ou instância de classe a ser encapsulado.
-   * @param options Configurações de comportamento.
-   * @returns O objeto original extendido com métodos de evento ($on, $dispose).
-   */
   static wrap<T extends object>(target: T, options: EventSourcingOptions = {}): EventSourced<T> {
     const handlers = new Set<(event: DomainEvent) => void>();
-    const { healthIntervalMs = 30000, enableHealthCheck = true } = options;
-    const className = target.constructor.name;
+    const history: DomainEvent[] = [];
+    const maxHistory = Math.max(0, options.maxHistory ?? 5_000);
+    let sinkQueue = Promise.resolve();
+    const emitter = options.eventEmitter;
+    const className = target.constructor?.name || 'AnonymousActor';
+    const correlationId = options.correlationId ?? randomUUID();
+    const canonicalName = options.canonicalName ?? className;
+    const version = options.version ?? '1.0.0';
+    const producer = options.producer ?? className;
+    const context = options.context ?? className;
 
-    // Função interna para disparar eventos
-    const emit = (type: string, payload: any, method?: string) => {
-      const event: DomainEvent = {
+    const emit = (type: string, payload: unknown, method?: string, metadata: EventMetadataInput = {}) => {
+      const eventId = uuidv7();
+      const event: DomainEvent = Object.freeze({
+        event_id: eventId,
+        id: eventId,
         type,
-        timestamp: Date.now(),
+        canonical_name: `${canonicalName}.${type}`,
+        version,
+        producer,
+        context,
+        timestamp: new Date().toISOString(),
+        correlation_id: correlationId,
+        causality_id: history[history.length - 1]?.id,
         payload,
-        metadata: {
-          method,
-          targetClass: className,
-        },
-      };
-
-      if (options.onEvent) options.onEvent(event);
-      handlers.forEach((h) => h(event));
+        metadata: Object.freeze({ ...metadata, targetClass: className, method }),
+      });
+      if (maxHistory > 0) {
+        history.push(event);
+        if (history.length > maxHistory) history.splice(0, history.length - maxHistory);
+      }
+      emitter?.emit(event.canonical_name, event);
+      emitter?.emit('domain.event', event);
+      // Serialize persistence callbacks. A busy API must not create one
+      // unbounded database promise per method invocation.
+      if (options.eventSink) {
+        sinkQueue = sinkQueue
+          .then(() => options.eventSink!.append(event))
+          .catch(() => undefined);
+      }
+      void options.onEvent?.(event);
+      for (const handler of handlers) handler(event);
+      return event;
     };
 
-    // Configuração do Health Check
-    let healthTimer: any = null;
-    if (enableHealthCheck) {
+    let healthTimer: NodeJS.Timeout | undefined;
+    if (options.enableHealthCheck) {
       healthTimer = setInterval(() => {
-        emit('health_check', { status: 'alive', memory: (process as any)?.memoryUsage?.() || 'N/A' });
-      }, healthIntervalMs);
+        emit('health_check', { status: 'alive', memory: process.memoryUsage() });
+      }, options.healthIntervalMs ?? 30_000);
     }
 
-    // Criação do Proxy para interceptar chamadas de métodos
     const proxy = new Proxy(target, {
-      get(target: any, prop: string | symbol, receiver: any) {
-        // Métodos especiais do wrapper
-        if (prop === '$on') {
-          return (handler: (event: DomainEvent) => void) => handlers.add(handler);
-        }
-        if (prop === '$dispose') {
-          return () => {
-            if (healthTimer) clearInterval(healthTimer);
-            handlers.clear();
-          };
-        }
+      get(currentTarget, prop, receiver) {
+        if (prop === '$on') return (handler: (event: DomainEvent) => void) => { handlers.add(handler); return () => handlers.delete(handler); };
+        if (prop === '$off') return (handler: (event: DomainEvent) => void) => { handlers.delete(handler); };
+        if (prop === '$events') return () => [...history];
+        if (prop === '$dispose') return () => { if (healthTimer) clearInterval(healthTimer); handlers.clear(); };
 
-        const value = Reflect.get(target, prop, receiver);
+        // Use the original target as receiver. This is required for classes
+        // using ECMAScript private fields (#field), whose brand check rejects
+        // a Proxy receiver even when the method itself is invoked correctly.
+        const value = Reflect.get(currentTarget, prop, currentTarget);
+        if (typeof value !== 'function') return value;
 
-        // Se for uma função, envolvemos ela para capturar o retorno
-        if (typeof value === 'function') {
-          return (...args: any[]) => {
-            const result = value.apply(target, args);
-
-            // Se for uma Promise, tratamos o resolve
-            if (result instanceof Promise) {
-              return result.then((res) => {
-                emit('method_return', { args, return: res }, prop.toString());
-                return res;
-              });
+        return (...args: unknown[]) => {
+          try {
+            const result = value.apply(currentTarget, args);
+            if (result && typeof (result as Promise<unknown>).then === 'function') {
+              return Promise.resolve(result).then(
+                (resolved) => { emit('method_return', { args, return: resolved }, String(prop), { success: true }); return resolved; },
+                (error: unknown) => { const serialized = serializeError(error); emit('method_error', serialized, String(prop), { success: false, error: serialized }); throw error; },
+              );
             }
-
-            // Emite o evento após a execução bem-sucedida (Event Sourcing pattern)
-            emit('method_return', { args, return: result }, prop.toString());
+            emit('method_return', { args, return: result }, String(prop), { success: true });
             return result;
-          };
-        }
-
-        return value;
+          } catch (error) {
+            const serialized = serializeError(error);
+            emit('method_error', serialized, String(prop), { success: false, error: serialized });
+            throw error;
+          }
+        };
       },
     });
 
@@ -110,40 +158,7 @@ export class EventSourcingFactory {
   }
 }
 
-// --- EXEMPLO DE USO ---
-
-class UserService {
-  private users: string[] = [];
-
-  addUser(name: string) {
-    this.users.push(name);
-    return { id: Math.random(), name };
-  }
-
-  getUsers() {
-    return this.users;
-  }
+function serializeError(error: unknown): { name: string; message: string } {
+  if (error instanceof Error) return { name: error.name, message: error.message };
+  return { name: 'UnknownError', message: String(error) };
 }
-
-// 1. Instanciamos a classe original
-const rawService = new UserService();
-
-// 2. Encapsulamos com a Factory
-const service = EventSourcingFactory.wrap(rawService, {
-  healthIntervalMs: 5000, // Health a cada 5 segundos para o exemplo
-  onEvent: (e) => console.log(`[LOG GLOBAL]: ${e.type} em ${e.metadata.method || 'system'}`)
-});
-
-// 3. Ouvindo eventos específicos desta instância
-service.$on((event) => {
-  if (event.type === 'method_return') {
-    console.log(`Evento capturado! Método: ${event.metadata.method}`);
-    console.log(`Payload:`, event.payload);
-  }
-});
-
-// 4. Executando métodos normalmente (com tipagem preservada)
-service.addUser("Alice");
-service.addUser("Bob");
-
-// O health check rodará em background até chamarmos service.$dispose()
