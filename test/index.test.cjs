@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { EventSourcingFactory, uuidv7 } = require('../dist/index.js');
 
-test('records sync returns, failures, correlation and causality', () => {
+test('sends execution telemetry without creating domain events', () => {
   class Actor {
     add(value) { return value + 1; }
     fail() { throw new Error('expected failure'); }
@@ -11,21 +11,39 @@ test('records sync returns, failures, correlation and causality', () => {
 
   const transport = new EventEmitter();
   const events = [];
+  const observations = [];
   transport.on('domain.event', (event) => events.push(event));
+  transport.on('observability.event', (event) => observations.push(event));
   const actor = EventSourcingFactory.wrap(new Actor(), {
-    canonicalName: 'Test.Actor', context: 'Test', eventEmitter: transport,
+    canonicalName: 'Test.Actor', context: 'Test', eventEmitter: transport, observabilityEmitter: transport,
   });
 
   assert.equal(actor.add(1), 2);
   assert.throws(() => actor.fail(), /expected failure/);
-  assert.equal(events.length, 2);
-  assert.equal(events[0].canonical_name, 'Test.Actor.method_return');
-  assert.equal(events[1].type, 'method_error');
-  assert.equal(events[0].correlation_id, events[1].correlation_id);
-  assert.equal(events[1].causality_id, events[0].id);
-  assert.match(events[0].event_id, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-  assert.equal(events[0].id, events[0].event_id);
-  assert.equal(actor.$events().length, 2);
+  assert.equal(events.length, 0);
+  assert.equal(observations.length, 2);
+  assert.equal(observations[0].type, 'method_return');
+  assert.equal(observations[1].type, 'method_error');
+  assert.equal(observations[0].correlation_id, observations[1].correlation_id);
+  assert.equal(actor.$events().length, 0);
+});
+
+test('persists only an explicitly emitted semantic event', async () => {
+  const events = [];
+  const actor = EventSourcingFactory.wrap({ read: () => 'value' }, {
+    eventEmitter: new EventEmitter(),
+    eventSink: { append: async (event) => events.push(event) },
+  });
+
+  actor.read();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(events.length, 0);
+
+  actor.$emitSemanticEvent('ProductCreated', { productId: 'p-1' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'ProductCreated');
+  assert.equal(events[0].metadata.kind, 'semantic');
 });
 
 test('generates time-ordered UUIDv7 identifiers', () => {

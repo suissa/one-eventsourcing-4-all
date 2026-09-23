@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
 /** A versioned fact produced by an event-sourced actor. */
@@ -16,6 +16,7 @@ export interface DomainEvent<TPayload = unknown> {
   causality_id?: string;
   payload: TPayload;
   metadata: {
+    kind: 'semantic';
     method?: string;
     targetClass: string;
     success?: boolean;
@@ -23,11 +24,26 @@ export interface DomainEvent<TPayload = unknown> {
   };
 }
 
+export interface ObservabilityEvent<TPayload = unknown> {
+  type: 'method_return' | 'method_error' | 'health_check';
+  actor: string;
+  method?: string;
+  timestamp: string;
+  correlation_id: string;
+  payload: TPayload;
+  success?: boolean;
+  error?: { name: string; message: string };
+}
+
 export interface EventSink {
   append(event: DomainEvent): void | Promise<void>;
 }
 
-type EventMetadataInput = Omit<DomainEvent['metadata'], 'targetClass'>;
+export interface EventEmitterLike {
+  emit(event: string, ...args: unknown[]): unknown;
+}
+
+export type EventMetadataInput = Omit<DomainEvent['metadata'], 'targetClass' | 'kind'>;
 
 export interface EventSourcingOptions {
   canonicalName?: string;
@@ -38,6 +54,9 @@ export interface EventSourcingOptions {
   eventEmitter?: EventEmitter;
   eventSink?: EventSink;
   onEvent?: (event: DomainEvent) => void | Promise<void>;
+  /** Receives execution telemetry without making it a domain event. */
+  observabilityEmitter?: EventEmitterLike;
+  onObservation?: (event: ObservabilityEvent) => void;
   /** Disabled by default so importing a module never leaves an open timer. */
   enableHealthCheck?: boolean;
   healthIntervalMs?: number;
@@ -46,7 +65,7 @@ export interface EventSourcingOptions {
 }
 
 /** Generates a RFC 9562 UUIDv7 with millisecond time ordering. */
-export function uuidv7(now = Date.now()): string {
+export function generateId(now = Date.now()): string {
   const bytes = randomBytes(16);
   const timestamp = BigInt(now);
   for (let index = 5; index >= 0; index -= 1) {
@@ -58,14 +77,18 @@ export function uuidv7(now = Date.now()): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+/** @deprecated Use generateId. Kept as a compatibility alias for package consumers. */
+export const uuidv7 = generateId;
+
 export type EventSourced<T> = T & {
   $on(handler: (event: DomainEvent) => void): () => void;
   $off(handler: (event: DomainEvent) => void): void;
   $events(): readonly DomainEvent[];
+  $emitSemanticEvent(type: string, payload: unknown, metadata?: EventMetadataInput): DomainEvent;
   $dispose(): void;
 };
 
-/** Wraps an actor and records method returns and failures as immutable facts. */
+/** Wraps an actor while keeping execution telemetry separate from domain facts. */
 export class EventSourcingFactory {
   static wrap<T extends object>(target: T, options: EventSourcingOptions = {}): EventSourced<T> {
     const handlers = new Set<(event: DomainEvent) => void>();
@@ -74,13 +97,13 @@ export class EventSourcingFactory {
     let sinkQueue = Promise.resolve();
     const emitter = options.eventEmitter;
     const className = target.constructor?.name || 'AnonymousActor';
-    const correlationId = options.correlationId ?? randomUUID();
+    const correlationId = options.correlationId ?? generateId();
     const canonicalName = options.canonicalName ?? className;
     const version = options.version ?? '1.0.0';
     const producer = options.producer ?? className;
     const context = options.context ?? className;
 
-    const emit = (type: string, payload: unknown, method?: string, metadata: EventMetadataInput = {}) => {
+    const emitSemantic = (type: string, payload: unknown, method?: string, metadata: EventMetadataInput = {}) => {
       const eventId = uuidv7();
       const event: DomainEvent = Object.freeze({
         event_id: eventId,
@@ -94,7 +117,7 @@ export class EventSourcingFactory {
         correlation_id: correlationId,
         causality_id: history[history.length - 1]?.id,
         payload,
-        metadata: Object.freeze({ ...metadata, targetClass: className, method }),
+        metadata: Object.freeze({ ...metadata, kind: 'semantic', targetClass: className, method }),
       });
       if (maxHistory > 0) {
         history.push(event);
@@ -114,10 +137,27 @@ export class EventSourcingFactory {
       return event;
     };
 
+    const observe = (type: ObservabilityEvent['type'], payload: unknown, method?: string,
+      metadata: Pick<ObservabilityEvent, 'success' | 'error'> = {}) => {
+      const observation: ObservabilityEvent = Object.freeze({
+        type,
+        actor: canonicalName,
+        method,
+        timestamp: new Date().toISOString(),
+        correlation_id: correlationId,
+        payload,
+        ...metadata,
+      });
+      options.observabilityEmitter?.emit(`observability.${type}`, observation);
+      options.observabilityEmitter?.emit('observability.event', observation);
+      options.onObservation?.(observation);
+      return observation;
+    };
+
     let healthTimer: NodeJS.Timeout | undefined;
     if (options.enableHealthCheck) {
       healthTimer = setInterval(() => {
-        emit('health_check', { status: 'alive', memory: process.memoryUsage() });
+        observe('health_check', { status: 'alive', memory: process.memoryUsage() });
       }, options.healthIntervalMs ?? 30_000);
     }
 
@@ -127,6 +167,10 @@ export class EventSourcingFactory {
         if (prop === '$off') return (handler: (event: DomainEvent) => void) => { handlers.delete(handler); };
         if (prop === '$events') return () => [...history];
         if (prop === '$dispose') return () => { if (healthTimer) clearInterval(healthTimer); handlers.clear(); };
+        if (prop === '$emitSemanticEvent') {
+          return (type: string, payload: unknown, metadata: EventMetadataInput = {}) =>
+            emitSemantic(type, payload, undefined, metadata);
+        }
 
         // Use the original target as receiver. This is required for classes
         // using ECMAScript private fields (#field), whose brand check rejects
@@ -139,15 +183,15 @@ export class EventSourcingFactory {
             const result = value.apply(currentTarget, args);
             if (result && typeof (result as Promise<unknown>).then === 'function') {
               return Promise.resolve(result).then(
-                (resolved) => { emit('method_return', { args, return: resolved }, String(prop), { success: true }); return resolved; },
-                (error: unknown) => { const serialized = serializeError(error); emit('method_error', serialized, String(prop), { success: false, error: serialized }); throw error; },
+                (resolved) => { observe('method_return', { args, return: resolved }, String(prop), { success: true }); return resolved; },
+                (error: unknown) => { const serialized = serializeError(error); observe('method_error', serialized, String(prop), { success: false, error: serialized }); throw error; },
               );
             }
-            emit('method_return', { args, return: result }, String(prop), { success: true });
+            observe('method_return', { args, return: result }, String(prop), { success: true });
             return result;
           } catch (error) {
             const serialized = serializeError(error);
-            emit('method_error', serialized, String(prop), { success: false, error: serialized });
+            observe('method_error', serialized, String(prop), { success: false, error: serialized });
             throw error;
           }
         };
