@@ -1,7 +1,6 @@
 <p align="center">
   <img width="1448" height="1086" alt="image" src="https://github.com/user-attachments/assets/1c254960-3f2f-4074-81f0-06f31d8172e6" />
-</p>p>
-
+</p>
 
 ### Event Sourcing transparente via Proxy — zero config, zero dependências.
 
@@ -16,8 +15,7 @@
 
 <br/>
 
-**Transforme qualquer objeto ou classe em uma entidade event-sourced.**
-<br/>
+**Transforme qualquer objeto ou classe em uma entidade event-sourced.**  
 **Sem alterar uma linha do seu código original.**
 
 ---
@@ -26,17 +24,14 @@
 
 ## 🧬 O que é?
 
-**`one-eventsourcing-4-all`** é uma micro-lib TypeScript que aplica a fronteira de Event Sourcing de forma **transparente** usando `ES6 Proxy` e os eventos do Node.
+**`one-eventsourcing-4-all`** é uma micro-lib TypeScript de alto desempenho que aplica a fronteira de Event Sourcing e Observabilidade de forma **transparente** usando `ES6 Proxy` e `EventEmitter`.
 
-Você envolve qualquer objeto — seja um POJO, uma instância de classe, um serviço, um repositório — e automaticamente **toda chamada de método** passa a emitir eventos tipados com:
+A arquitetura separa explicitamente **Telemetria de Execução** de **Fatos Semânticos de Domínio**:
 
-- 🕐 **Timestamp** ISO exato da execução
-- 🆔 **ID, correlação e causalidade** para rastreamento
-- 📦 **Payload** com argumentos e retorno
-- 🏷️ **Metadata** com nome do método e classe de origem
-- 💓 **Health Check** opcional em background (desligado por padrão)
+1. 🔍 **Telemetria Transparente (`ObservabilityEvent`)**: Captura automaticamente retornos de métodos (`method_return`), falhas (`method_error`) e pulsos de vida (`health_check`) com tempos, argumentos e correlation ID, sem poluir o histórico de domínio.
+2. 🏛️ **Fatos de Negócio Imutáveis (`DomainEvent`)**: Registro explícito de eventos de negócio versionados com IDs RFC 9562 **UUIDv7** ordenados no tempo, cadeias de causalidade (`causality_id`), nomes canônicos e persistência assíncrona serializada (`eventSink`).
 
-> **Zero config. Zero dependências. Zero fricção.**
+> **Zero config. Zero dependências externas. Compatibilidade total com campos privados ECMAScript (`#private`).**
 
 <br/>
 
@@ -54,7 +49,7 @@ Você envolve qualquer objeto — seja um POJO, uma instância de classe, um ser
 class UserService {
   addUser(name: string) {
     logger.info("addUser called", { name });
-    analytics.track("user_added", { name });
+    telemetry.record("addUser", { name });
     eventBus.emit("user:added", { name });
 
     this.users.push(name);
@@ -63,9 +58,9 @@ class UserService {
 }
 ```
 
-❌ Código poluído com side-effects<br/>
+❌ Código poluído com logs e telemetria<br/>
 ❌ Acoplamento entre lógica e observabilidade<br/>
-❌ Violação do SRP<br/>
+❌ Violação do SRP (Single Responsibility)<br/>
 ❌ Difícil de manter e testar<br/>
 
 </td>
@@ -82,18 +77,21 @@ class UserService {
 }
 
 const service = EventSourcingFactory.wrap(
-  new UserService()
+  new UserService(),
+  {
+    canonicalName: "User.Service",
+    eventSink: databaseSink,
+  }
 );
 
-service.$on(event => {
-  // Todos os eventos, automaticamente!
-});
+// Telemetria automática + emissão semântica limpa
+service.$emitSemanticEvent("UserCreated", { name: "Alice" });
 ```
 
-✅ Código limpo e focado<br/>
-✅ Zero acoplamento<br/>
-✅ Eventos automáticos via Proxy<br/>
-✅ Tipagem 100% preservada<br/>
+✅ Código limpo e focado na regra de negócio<br/>
+✅ Telemetria automática via Proxy<br/>
+✅ Event Store limpo sem ruído de métodos internos<br/>
+✅ Tipagem original 100% preservada<br/>
 
 </td>
 </tr>
@@ -105,21 +103,21 @@ service.$on(event => {
 
 ## 🏗️ Arquitetura
 
-```
-┌──────────┐    ┌────────────────────────────────────┐
-│          │    │      EventSourcingFactory           │
-│  Caller  │───▶│                                    │
-│          │    │  Proxy ──▶ Intercept ──▶ Emit Event │
-│          │◀───│                                    │
-└──────────┘    │  ┌────────────┐  ┌──────────────┐  │
-                │  │  onEvent   │  │  $on() local │  │
-                │  │  (global)  │  │  (instância) │  │
-                │  └────────────┘  └──────────────┘  │
-                │                                    │
-                │  🫀 Health Check (background)      │
-                └────────────────────────────────────┘
+```text
+┌──────────┐    ┌────────────────────────────────────────────────────────┐
+│          │    │                 EventSourcingFactory                   │
+│  Caller  │───▶│                                                        │
+│          │    │  Proxy ──▶ Intercept Method ──▶ ObservabilityEvent     │
+│          │◀───│     │                           (telemetria)           │
+└──────────┘    │     ▼                                                  │
+                │  $emitSemanticEvent() ───────▶ DomainEvent (UUIDv7)    │
+                │                                 ├─▶ EventSink (DB)     │
+                │                                 ├─▶ EventEmitter       │
+                │                                 └─▶ $on() local        │
+                │  🫀 Health Check (background)                          │
+                └────────────────────────────────────────────────────────┘
 
-Retorna: EventSourced<T> = T & { $on, $dispose }
+Retorna: EventSourced<T> = T & { $on, $off, $events, $emitSemanticEvent, $dispose }
 Tipagem original 100% preservada ✨
 ```
 
@@ -130,7 +128,14 @@ Tipagem original 100% preservada ✨
 ## 📦 Instalação
 
 ```bash
+# npm
+npm install @purecore/one-eventsourcing-4-all
+
+# bun
 bun add @purecore/one-eventsourcing-4-all
+
+# pnpm
+pnpm add @purecore/one-eventsourcing-4-all
 ```
 
 <br/>
@@ -142,23 +147,23 @@ bun add @purecore/one-eventsourcing-4-all
 ### 1️⃣ Importe a Factory
 
 ```typescript
-import { EventSourcingFactory } from "@purecore/one-eventsourcing-4-all";
+import { EventSourcingFactory, generateId } from "@purecore/one-eventsourcing-4-all";
 ```
 
 ### 2️⃣ Crie sua classe normalmente
 
 ```typescript
 class OrderService {
-  private orders: Map<string, number> = new Map();
+  #orders: Map<string, number> = new Map();
 
   createOrder(productId: string, quantity: number) {
-    const orderId = crypto.randomUUID();
-    this.orders.set(orderId, quantity);
+    const orderId = generateId();
+    this.#orders.set(orderId, quantity);
     return { orderId, productId, quantity, status: "created" };
   }
 
   cancelOrder(orderId: string) {
-    this.orders.delete(orderId);
+    this.#orders.delete(orderId);
     return { orderId, status: "cancelled" };
   }
 }
@@ -168,23 +173,30 @@ class OrderService {
 
 ```typescript
 const orderService = EventSourcingFactory.wrap(new OrderService(), {
-  enableHealthCheck: false,
-  healthIntervalMs: 10_000,
+  canonicalName: "Commerce.OrderService",
+  context: "Commerce",
+  onObservation: (obs) => {
+    // Telemetria automática de chamadas (method_return, method_error)
+    console.log(`[TELEMETRY] ${obs.actor}.${obs.method} (${obs.type})`);
+  },
   onEvent: (event) => {
-    // log global de todos os eventos
-    console.log(`[${event.metadata.targetClass}] ${event.type}`);
+    // Fatos de domínio emitidos para Event Store
+    console.log(`[DOMAIN EVENT] ${event.canonical_name} (${event.id})`);
   },
 });
 ```
 
-### 4️⃣ Use normalmente — os eventos são automáticos!
+### 4️⃣ Use normalmente e emita fatos de negócio quando apropriado
 
 ```typescript
+// Execução normal (emite telemetria automática sem poluir o Event Store)
 const order = orderService.createOrder("SKU-001", 3);
-// → [OrderService] method_return
 
-orderService.cancelOrder(order.orderId);
-// → [OrderService] method_return
+// Emissão de fato semântico de domínio (UUIDv7, persistência assíncrona)
+orderService.$emitSemanticEvent("OrderCreated", {
+  orderId: order.orderId,
+  quantity: order.quantity,
+});
 ```
 
 <br/>
@@ -195,45 +207,80 @@ orderService.cancelOrder(order.orderId);
 
 ### `EventSourcingFactory.wrap<T>(target, options?)`
 
-Transforma um objeto em uma entidade event-sourced.
+Envolve um objeto ou instância de classe com capacidades de Event Sourcing e telemetria transparente.
 
 | Parâmetro | Tipo | Descrição |
 |---|---|---|
 | `target` | `T extends object` | Objeto ou instância de classe |
-| `options` | `EventSourcingOptions` | Configurações opcionais |
+| `options` | `EventSourcingOptions` | Configurações opcionais de canal, sink e telemetria |
 
-**Retorna:** `EventSourced<T>` — o mesmo tipo com `$on()` e `$dispose()`.
+**Retorna:** `EventSourced<T>` — a instância original com métodos `$on()`, `$off()`, `$events()`, `$emitSemanticEvent()` e `$dispose()`.
 
 ---
 
 ### `EventSourcingOptions`
 
-| Propriedade | Tipo | Default | Descrição |
+| Propriedade | Tipo | Padrão | Descrição |
 |---|---|---|---|
-| `healthIntervalMs` | `number` | `30000` | Intervalo do health check em ms |
-| `enableHealthCheck` | `boolean` | `true` | Ativa/desativa o health check |
-| `onEvent` | `(e: DomainEvent) => void` | `undefined` | Callback global |
+| `canonicalName` | `string` | Nome da classe | Nome canônico do ator no sistema |
+| `version` | `string` | `'1.0.0'` | Versão do schema/ator |
+| `producer` | `string` | Nome da classe | Identificador do produtor do evento |
+| `context` | `string` | Nome da classe | Contexto semântico de domínio |
+| `correlationId` | `string` | `generateId()` (UUIDv7) | ID de correlação raiz para a sessão |
+| `eventSink` | `EventSink` | `undefined` | Mecanismo de persistência assíncrona serializada (`append(event)`) |
+| `eventEmitter` | `EventEmitter` | `undefined` | EventEmitter global para eventos de domínio |
+| `onEvent` | `(e: DomainEvent) => void` | `undefined` | Callback para cada evento de domínio emitido |
+| `observabilityEmitter` | `EventEmitterLike` | `undefined` | Barramento para telemetria (`observability.event`) |
+| `onObservation` | `(o: ObservabilityEvent) => void` | `undefined` | Callback para telemetria de chamadas de método |
+| `maxHistory` | `number` | `5000` | Quantidade de eventos recentes mantidos em memória (`$events()`) |
+| `enableHealthCheck` | `boolean` | `false` | Ativa heartbeat de monitoramento periódico |
+| `healthIntervalMs` | `number` | `30000` | Intervalo do health check em milissegundos |
 
 ---
 
-### `DomainEvent`
+### `DomainEvent<TPayload>`
+
+Estrutura imutável de um fato de negócio gravado no Event Store:
 
 ```typescript
-interface DomainEvent {
-  id: string;
-  type: string;          // "method_return" | "method_error" | "health_check"
-  canonical_name: string;
-  version: string;
-  producer: string;
-  context: string;
+interface DomainEvent<TPayload = unknown> {
+  event_id: string;        // UUIDv7 (RFC 9562) ordenável no tempo
+  id: string;              // Alias de compatibilidade para event_id
+  type: string;            // Ex: "OrderCreated", "PaymentProcessed"
+  canonical_name: string;  // Ex: "Commerce.OrderService.OrderCreated"
+  version: string;         // Ex: "1.0.0"
+  producer: string;        // Identificador do produtor
+  context: string;         // Contexto do domínio
+  timestamp: string;       // ISO 8601 UTC
+  correlation_id: string;  // UUIDv7 correlacionando a sessão/transação
+  causality_id?: string;   // ID do evento imediatamente anterior na cadeia
+  payload: TPayload;       // Dados de negócio imutáveis
+  metadata: {
+    kind: 'semantic';      // Demarca fato de negócio
+    method?: string;
+    targetClass: string;
+    success?: boolean;
+    error?: { name: string; message: string };
+  };
+}
+```
+
+---
+
+### `ObservabilityEvent<TPayload>`
+
+Estrutura de telemetria emitida durante a execução dos métodos:
+
+```typescript
+interface ObservabilityEvent<TPayload = unknown> {
+  type: 'method_return' | 'method_error' | 'health_check';
+  actor: string;
+  method?: string;
   timestamp: string;
   correlation_id: string;
-  causality_id?: string;
-  payload: unknown;
-  metadata: {
-    method?: string;     // Nome do método chamado
-    targetClass: string; // Nome da classe original
-  };
+  payload: TPayload;
+  success?: boolean;
+  error?: { name: string; message: string };
 }
 ```
 
@@ -241,10 +288,25 @@ interface DomainEvent {
 
 ### `EventSourced<T>`
 
+Extensão aplicada sobre o tipo original `T`:
+
 | Método | Assinatura | Descrição |
 |---|---|---|
-| `$on` | `(handler: (e: DomainEvent) => void) => void` | Registra listener |
-| `$dispose` | `() => void` | Remove listeners e para o health check |
+| `$emitSemanticEvent` | `(type: string, payload: unknown, metadata?: object) => DomainEvent` | Emite e persiste um fato semântico de domínio |
+| `$on` | `(handler: (e: DomainEvent) => void) => () => void` | Registra listener local para eventos de domínio |
+| `$off` | `(handler: (e: DomainEvent) => void) => void` | Remove um listener |
+| `$events` | `() => readonly DomainEvent[]` | Retorna o snapshot do histórico em memória |
+| `$dispose` | `() => void` | Cancela timers e libera handlers |
+
+---
+
+### Utilitários Exportados
+
+#### `generateId(now?: number): string`
+Gera um identificador **UUIDv7** compatível com RFC 9562, ordenável lexicograficamente no tempo com precisão de milissegundos.
+
+#### `uuidv7(now?: number): string`
+Alias `@deprecated` de compatibilidade direta para `generateId()`.
 
 <br/>
 
@@ -252,130 +314,70 @@ interface DomainEvent {
 
 ## 🎯 Casos de Uso
 
-### 📊 Audit Trail
+### 📊 Persistência Assíncrona Serializada (`EventSink`)
+
+Garante que chamadas simultâneas de métodos não criem promessas concorrentes desgovernadas no banco:
 
 ```typescript
-const auditLog: DomainEvent[] = [];
-
-const paymentService = EventSourcingFactory.wrap(new PaymentService(), {
-  onEvent: (event) => {
-    auditLog.push(event);
-    // Persista no banco, envie para Kafka, etc.
+const databaseSink: EventSink = {
+  async append(event) {
+    await db.collection("events").insertOne(event);
   },
+};
+
+const service = EventSourcingFactory.wrap(new PaymentProcessor(), {
+  canonicalName: "Financial.Payments",
+  eventSink: databaseSink,
 });
 
-paymentService.processPayment("user-42", 199.90);
+service.$emitSemanticEvent("PaymentCaptured", { amount: 1500, currency: "BRL" });
 ```
 
-### 🔄 CQRS + Event Sourcing
+### 🔄 CQRS & Projeções Reativas
 
 ```typescript
-const commandService = EventSourcingFactory.wrap(new WriteModel());
+const service = EventSourcingFactory.wrap(new WriteModel());
 
-commandService.$on((event) => {
-  if (event.type === "method_return") {
-    readModel.project(event); // Projection
+service.$on((event) => {
+  if (event.type === "OrderCreated") {
+    orderSummaryProjection.apply(event);
   }
 });
 ```
 
-### 🧪 Debug & Profiling
+### 🔒 Suporte a ECMAScript Private Fields (`#private`)
+
+Ao contrário de proxies convencionais, a lib utiliza o alvo original como `receiver` nos métodos internos, garantindo que classes com campos privados nativos não lancem `TypeError: Cannot read private member`:
 
 ```typescript
-const debugService = EventSourcingFactory.wrap(new CriticalService(), {
-  onEvent: (event) => {
-    const elapsed = Date.now() - event.timestamp;
-    if (elapsed > 100) {
-      console.warn(`⚠️ Slow: ${event.metadata.method} (${elapsed}ms)`);
-    }
-  },
-});
-```
+class SecureWallet {
+  #balance = 1000;
 
-### 🌐 Async/Await nativo
-
-```typescript
-class ApiService {
-  async fetchUser(id: string) {
-    const res = await fetch(`/api/users/${id}`);
-    return res.json();
+  withdraw(val: number) {
+    if (this.#balance < val) throw new Error("Saldo insuficiente");
+    this.#balance -= val;
+    return this.#balance;
   }
 }
 
-const api = EventSourcingFactory.wrap(new ApiService());
-
-api.$on((event) => {
-  // Evento emitido APÓS o resolve da Promise
-  console.log("Resolved:", event.payload.return);
-});
-
-await api.fetchUser("42");
+// Funciona 100% sem quebrar o brand check nativo
+const wallet = EventSourcingFactory.wrap(new SecureWallet());
+wallet.withdraw(100);
 ```
 
 <br/>
 
 ---
 
-## 🧩 Como Funciona
-
-A mágica acontece em 3 camadas:
-
-1. **`Proxy` com trap `get`** → Intercepta todo acesso a propriedades
-2. **Detecção de função** → Se o valor é uma função, cria um wrapper
-3. **Emissão pós-execução** → Após execução (ou resolve da Promise), emite o `DomainEvent`
-
-### Princípios de Design
+## 🧩 Princípios de Design
 
 | Princípio | Aplicação |
 |---|---|
-| **Open/Closed** | Classes originais não são modificadas |
-| **Single Responsibility** | Lógica de negócio não sabe dos eventos |
-| **Dependency Inversion** | O consumidor decide o que fazer |
-| **Transparency** | Proxy preserva a interface original |
-| **Type Safety** | Generics garantem tipagem completa |
-
-<br/>
-
----
-
-## 🧠 Filosofia
-
-> *"Você não deveria precisar modificar seu código para observá-lo."*
-
-O mesmo mecanismo usado pelo **Vue.js** para reatividade, pelo **MobX** para observables, e pelo **Immer** para imutabilidade — aplicado ao **Event Sourcing**.
-
-- 🪶 **Não pesa** — menos de 5KB, zero deps
-- 🧊 **Não invade** — seu código continua puro
-- 🔌 **Não acopla** — conecte qualquer consumer
-- ⚡ **Não bloqueia** — async-first por design
-
-<br/>
-
----
-
-## 🗂️ Estrutura do Projeto
-
-```
-one-eventsourcing-4-all/
-├── src/
-│   └── index.ts       # A lib inteira — simples e poderosa
-├── .gitignore
-├── CHANGELOG.md
-└── README.md          # Você está aqui 👋
-```
-
-📋 Veja o [CHANGELOG.md](CHANGELOG.md) para o histórico de mudanças.
-
-<br/>
-
----
-
-## 🤝 Contribuindo
-
-1. Fork o repositório
-2. Crie sua branch: `git checkout -b feat/minha-feature`
-3. Faça suas alterações
-4. Envie um PR com descrição clara
+| **Separation of Concerns** | Telemetria (`ObservabilityEvent`) e fatos de negócio (`DomainEvent`) são fluxos desacoplados |
+| **Open/Closed** | As classes originais não são alteradas nem requerem herança |
+| **Time-Ordered Identity** | Todos os IDs (`event_id`, `correlation_id`) são UUIDv7 (RFC 9562) |
+| **Backpressure Safe** | O `EventSink` serializa a persistência sem sobrecarregar a conexão |
+| **Type Safety** | Generics preservam 100% dos tipos e assinaturas dos métodos |
 
 <br/>
 
@@ -384,18 +386,3 @@ one-eventsourcing-4-all/
 ## 📜 Licença
 
 MIT © [PureCore](https://github.com/purecore)
-
-<br/>
-
----
-
-<div align="center">
-
-*"Observe everything. Change nothing."*
-
-**Feito com 🧠 por [@purecore](https://github.com/purecore)**
-
-**[⬆ Voltar ao topo](#-one-eventsourcing-4-all)**
-
-</div>
-]]>
